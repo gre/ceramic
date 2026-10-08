@@ -7,16 +7,16 @@ using ceramic.Extensions;
 /**
  * High-performance Bezier curve easing for smooth animations.
  * 
- * This class implements cubic and quadratic Bezier easing functions with a
- * closed-form solver and intelligent caching. Based on the implementation from
- * https://github.com/gre/bezier-easing, extended to support both cubic and
- * quadratic curves.
+ * This class implements cubic and quadratic Bezier easing functions with optimized
+ * performance through pre-computed sample tables and intelligent caching. Based on
+ * the implementation from https://github.com/gre/bezier-easing, extended to support
+ * both cubic and quadratic curves.
  * 
  * ## Features
  * 
  * - **Cubic Bezier**: Standard CSS-style cubic-bezier(x1, y1, x2, y2)
  * - **Quadratic Bezier**: Simplified two-point control
- * - **Exact and fast**: Closed-form solver, no iteration
+ * - **Performance Optimized**: Pre-computed samples and Newton-Raphson iteration
  * - **Instance Caching**: Automatic reuse of common easing functions
  * - **Linear Detection**: Automatically optimizes linear easings
  * 
@@ -41,7 +41,8 @@ using ceramic.Extensions;
  * 
  * ## Performance Notes
  * 
- * - Each call solves the cubic in closed form (no sample table, no iteration)
+ * - First call pre-computes 11 sample points
+ * - Subsequent calls use Newton-Raphson method (4 iterations max)
  * - Linear easings bypass all calculations
  * - Cache stores up to 10,000 instances
  * 
@@ -50,6 +51,27 @@ using ceramic.Extensions;
  */
 class BezierEasing {
 
+    /** Number of pre-computed samples for faster lookup */
+    static var SPLINE_TABLE_SIZE = 11;
+    
+    /** Distance between each sample point */
+    static var SAMPLE_STEP_SIZE = 1.0 / (SPLINE_TABLE_SIZE - 1.0);
+    
+    /** Maximum iterations for Newton-Raphson method */
+    static var NEWTON_ITERATIONS = 4;
+    
+    /** Minimum slope to use Newton-Raphson (below this, use subdivision) */
+    static var NEWTON_MIN_SLOPE = 0.001;
+    
+    /** Precision threshold for binary subdivision */
+    static var SUBDIVISION_PRECISION = 1e-14;
+    
+    /** Maximum iterations for binary subdivision */
+    static var SUBDIVISION_MAX_ITERATIONS = 60;
+
+    /** Newton-Raphson is considered converged when its last step is below this */
+    static var NEWTON_CONVERGENCE = 0.000001;
+    
     /** Constant for quadratic to cubic conversion */
     static var TWO_THIRD = 2.0 / 3.0;
 
@@ -59,15 +81,8 @@ class BezierEasing {
     /** Whether this easing is linear (optimization flag) */
     var linearEasing = false;
 
-    /** Coefficients of x(t) = ((2a * t + 3b) * t + 3c) * t */
-    var a:Float;
-    var b:Float;
-    var c:Float;
-
-    /** Coefficients of y(t) = ((ay * t + by) * t + cy) * t */
-    var ay:Float;
-    var by:Float;
-    var cy:Float;
+    /** Pre-computed sample values for performance */
+    var sampleValues:Array<Float>;
 
     /** Whether this instance is stored in the cache */
     var cached:Bool = false;
@@ -142,12 +157,12 @@ class BezierEasing {
         }
         else {
             linearEasing = false;
-            a = (3 * mX1 - 3 * mX2 + 1) / 2;
-            b = mX2 - 2 * mX1;
-            c = mX1;
-            ay = 3 * mY1 - 3 * mY2 + 1;
-            by = 3 * (mY2 - 2 * mY1);
-            cy = 3 * mY1;
+            // Precompute samples table
+            if (sampleValues == null)
+                sampleValues = [];
+            for (i in 0...SPLINE_TABLE_SIZE) {
+                sampleValues[i] = calcBezier(i * SAMPLE_STEP_SIZE, mX1, mX2);
+            }
         }
 
     }
@@ -169,41 +184,129 @@ class BezierEasing {
         // x outside (0, 1) saturates to 0 / 1
         if (x <= 0) return 0;
         if (x >= 1) return 1;
-        if (Math.isNaN(x)) return x;
-        var t = solveTForX(x);
-        return ((ay * t + by) * t + cy) * t;
+        return calcBezier(getTForX(x), mY1, mY2);
 
     }
 
     /**
-     * Solves x(t) = ((2a * t + 3b) * t + 3c) * t = x for t, with x in (0, 1):
-     * u = 1/t is the largest real root of x·u³ − 3c·u² − 3b·u − 2a = 0
+     * Finds the t parameter for a given x value using the pre-computed samples.
+     * Uses Newton-Raphson iteration when slope is sufficient, otherwise falls
+     * back to binary subdivision.
      */
-    function solveTForX(x:Float):Float {
+    inline function getTForX(aX:Float):Float {
 
-        var j = 1 / Math.max(c, Math.sqrt(x));
-        var k = x * j;
-        var l = k * j;
-        var s = c * j;
-        var q = b * l;
-        var m = s * s + q;
-        var h = -s * (s * s + 1.5 * q) - a * k * l;
-        var d = h * h - m * m * m;
-        var v:Float;
-        if (m == 0 || d > 1e-12 * h * h) {
-            // one real root (Cardano)
-            var w = h < 0 ? h - Math.sqrt(d) : h + Math.sqrt(d);
-            var u = w < 0 ? Math.pow(-w, 1 / 3) : -Math.pow(w, 1 / 3);
-            v = u + m / u;
-            if (Math.isNaN(v)) v = 0; // triple root (m = h = 0)
-        } else {
-            // three real roots, take the largest
-            var r = Math.sqrt(m);
-            v = 2 * r * Math.cos(Math.acos(Math.max(-1, Math.min(1, -h / (m * r)))) / 3);
+        var intervalStart = 0.0;
+        var currentSample = 1;
+        var lastSample = SPLINE_TABLE_SIZE - 1;
+
+        while (currentSample != lastSample && sampleValues[currentSample] <= aX) {
+            intervalStart += SAMPLE_STEP_SIZE;
+            currentSample++;
         }
-        return Math.min(1, k / (v + s));
+        currentSample--;
+
+        // Interpolate to provide an initial guess for t
+        var dist = (aX - sampleValues[currentSample]) / (sampleValues[currentSample + 1] - sampleValues[currentSample]);
+        var guessForT:Float = intervalStart + dist * SAMPLE_STEP_SIZE;
+
+        var initialSlope = getSlope(guessForT, mX1, mX2);
+        if (initialSlope >= NEWTON_MIN_SLOPE) {
+            var t = newtonRaphsonIterate(aX, guessForT, mX1, mX2);
+            if (t >= intervalStart && t <= intervalStart + SAMPLE_STEP_SIZE)
+                return t;
+            // Newton-Raphson did not converge (e.g. on steep curves such as (1, 0, 0, 1) around 0.5):
+            // bisect the sample interval instead
+            return binarySubdivide(aX, intervalStart, intervalStart + SAMPLE_STEP_SIZE, mX1, mX2);
+        } else if (initialSlope == 0.0) {
+            return guessForT;
+        } else {
+            return binarySubdivide(aX, intervalStart, intervalStart + SAMPLE_STEP_SIZE, mX1, mX2);
+        }
 
     }
+
+    /**
+     * Calculates the bezier curve value at parameter t.
+     * 
+     * @param aT The t parameter (0-1)
+     * @param aA1 First control point coordinate
+     * @param aA2 Second control point coordinate
+     * @return The curve value at t
+     */
+    inline function calcBezier(aT:Float, aA1:Float, aA2:Float) {
+
+        return ((A(aA1, aA2) * aT + B(aA1, aA2)) * aT + C(aA1)) * aT;
+
+    }
+
+    /**
+     * Calculates the derivative (slope) of the bezier curve at parameter t.
+     * 
+     * @param aT The t parameter (0-1)
+     * @param aA1 First control point coordinate
+     * @param aA2 Second control point coordinate
+     * @return The slope at t
+     */
+    inline function getSlope(aT:Float, aA1:Float, aA2:Float) {
+
+        return 3.0 * A(aA1, aA2) * aT * aT + 2.0 * B(aA1, aA2) * aT + C(aA1);
+
+    }
+
+    /**
+     * Uses binary subdivision to find t for a given x when Newton-Raphson
+     * is not suitable (low slope).
+     */
+    inline function binarySubdivide(aX:Float, aA:Float, aB:Float, mX1:Float, mX2:Float) {
+
+        var currentX:Float;
+        var currentT:Float;
+        var i = 0;
+
+        do {
+            currentT = aA + (aB - aA) / 2.0;
+            currentX = calcBezier(currentT, mX1, mX2) - aX;
+            if (currentX > 0.0) {
+                aB = currentT;
+            } else {
+                aA = currentT;
+            }
+        } while (Math.abs(currentX) > SUBDIVISION_PRECISION && ++i < SUBDIVISION_MAX_ITERATIONS);
+
+        return currentT;
+
+    }
+
+    /**
+     * Uses Newton-Raphson iteration to quickly converge on the t value
+     * for a given x coordinate.
+     */
+    function newtonRaphsonIterate(aX:Float, aGuessT:Float, mX1:Float, mX2:Float) {
+
+        var step = 0.0;
+        for (i in 0...NEWTON_ITERATIONS) {
+            var currentSlope = getSlope(aGuessT, mX1, mX2);
+            if (currentSlope == 0.0) {
+                return aGuessT;
+            }
+            var currentX = calcBezier(aGuessT, mX1, mX2) - aX;
+            step = currentX / currentSlope;
+            aGuessT -= step;
+        }
+
+        // -1 when not converged, so that the caller bisects instead
+        return Math.abs(step) <= NEWTON_CONVERGENCE ? aGuessT : -1;
+
+    }
+
+    /** Bezier coefficient A for cubic formula */
+    inline function A(aA1:Float, aA2:Float) { return 1.0 - 3.0 * aA2 + 3.0 * aA1; }
+    
+    /** Bezier coefficient B for cubic formula */
+    inline function B(aA1:Float, aA2:Float) { return 3.0 * aA2 - 6.0 * aA1; }
+    
+    /** Bezier coefficient C for cubic formula */
+    inline function C(aA1:Float)            { return 3.0 * aA1; }
 
     /**
      * Converts a quadratic control point to the first cubic control point.
